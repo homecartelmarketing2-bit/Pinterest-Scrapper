@@ -416,7 +416,7 @@ def get_standby_records(n=5):
     }
     params = {
         "view":            AIRTABLE_VIEW,
-        "filterByFormula": "{Status} = 'Standby'",
+        "filterByFormula": "AND({Status} = 'Standby', {Styled Photo} = BLANK())",
         "maxRecords":      n,
     }
     try:
@@ -986,6 +986,22 @@ def worker(term, folder_id, access_token, fresh=False, headless=True):
                     approved += 1
                     file_index += 1
                     print(f"  -> APPROVED & UPLOADED ({approved} new approved): {filename}")
+                    
+                    # ── Push to Airtable ──
+                    try:
+                        resp_json = upload_resp.json()
+                        data_list = resp_json.get("data", [])
+                        if data_list:
+                            file_id = data_list[0].get("attributes", {}).get("resource_id")
+                            if file_id:
+                                print(f"  [AIRTABLE] Launching push pipeline for {filename}...")
+                                push_photo_and_prompts(access_token, file_id, filename, image_bytes, mime, term)
+                            else:
+                                print(f"  [AIRTABLE] [WARNING] Could not find resource_id in upload response: {resp_json}")
+                        else:
+                            print(f"  [AIRTABLE] [WARNING] Empty data in upload response: {resp_json}")
+                    except Exception as e:
+                        print(f"  [AIRTABLE] [ERROR] Parsing upload response or pushing to Airtable: {e}")
                 else:
                     print(f"  [UPLOAD] Failed {filename}: {upload_resp.text[:200]}")
             except Exception as e:
