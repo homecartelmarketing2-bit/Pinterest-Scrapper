@@ -85,6 +85,36 @@ def patch_airtable_record(record_id, share_link):
         print(f"[AIRTABLE] Exception patching record {record_id}: {e}")
     return False
 
+def get_already_attached_filenames():
+    """Fetch all filenames that are already attached to the 'Styled Photo' field in Airtable."""
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE}"
+    headers = {
+        "Authorization": f"Bearer {AIRTABLE_TOKEN}",
+        "Content-Type":  "application/json",
+    }
+    params = {
+        "view":            AIRTABLE_VIEW,
+        "filterByFormula": "NOT({Styled Photo} = BLANK())",
+        "maxRecords":      500
+    }
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=15)
+        if resp.status_code == 200:
+            filenames = set()
+            for record in resp.json().get("records", []):
+                fields = record.get("fields", {})
+                attachments = fields.get("Styled Photo", [])
+                for att in attachments:
+                    fn = att.get("filename")
+                    if fn:
+                        filenames.add(fn)
+            return filenames
+        else:
+            print(f"[AIRTABLE] Error fetching populated records: {resp.text}")
+    except Exception as e:
+        print(f"[AIRTABLE] Exception fetching populated records: {e}")
+    return set()
+
 def main():
     print("[BATCH START] Fetching Zoho access token...")
     access_token = get_access_token()
@@ -98,7 +128,19 @@ def main():
         print("[BATCH DONE] No approved files found in Zoho Chandelier folder. Exiting.")
         return
         
-    print("\n[2] Fetching empty Standby records from Airtable...")
+    print("\n[2] Checking which files are already attached to Airtable...")
+    attached_names = get_already_attached_filenames()
+    print(f"Found {len(attached_names)} files already attached in Airtable.")
+    
+    # Filter out already attached files
+    to_process = [f for f in approved_files if f["name"] not in attached_names]
+    print(f"Found {len(to_process)} NEW approved files to attach.")
+    
+    if not to_process:
+        print("[BATCH DONE] All approved files are already attached to Airtable! Nothing to do.")
+        return
+        
+    print("\n[3] Fetching empty Standby records from Airtable...")
     airtable_records = get_empty_standby_airtable_records()
     print(f"Found {len(airtable_records)} empty Standby records in Airtable.")
     
@@ -106,10 +148,10 @@ def main():
         print("[BATCH DONE] No empty Standby records available in Airtable. Exiting.")
         return
         
-    print(f"\n[3] Starting batch attachment process (Max {min(len(approved_files), len(airtable_records))} operations)...")
+    print(f"\n[4] Starting batch attachment process (Max {min(len(to_process), len(airtable_records))} operations)...")
     
     success_count = 0
-    for idx, zoho_file in enumerate(approved_files):
+    for idx, zoho_file in enumerate(to_process):
         if idx >= len(airtable_records):
             print("\n[BATCH] Ran out of empty Airtable records. Stopping.")
             break
@@ -120,7 +162,7 @@ def main():
         sku = fields.get("SKU Code", "N/A")
         item_name = fields.get("Item Name", "N/A")
         
-        print(f"\nProcessing {idx+1}/{min(len(approved_files), len(airtable_records))}:")
+        print(f"\nProcessing {idx+1}/{min(len(to_process), len(airtable_records))}:")
         print(f"  Zoho File: {zoho_file['name']}")
         print(f"  Airtable : {sku} - {item_name}")
         
