@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local data stores & sensitive profiles (contains Pinterest login session)
+data/
+
+# Local downloaded raw images (very large)
+scraped_raw/
+
+# Persistent local scraping history
+scraped_manifest.json
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# Task & environment specific files
+*.log
+.system_generated/
+.env
