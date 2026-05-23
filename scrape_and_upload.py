@@ -416,7 +416,7 @@ def get_standby_records(n=5):
     }
     params = {
         "view":            AIRTABLE_VIEW,
-        "filterByFormula": "AND({Status} = 'Standby', {Styled Photo} = BLANK())",
+        "filterByFormula": "AND({Status} = 'Standby', {Reference Photo} = BLANK(), {Styled Photo Prompt} = BLANK())",
         "maxRecords":      n,
     }
     try:
@@ -443,43 +443,126 @@ def update_airtable_record(record_id, fields_dict):
     return False
 
 
-def get_fallback_prompts(term: str) -> list[str]:
-    # Clean term for clean generic prompts
-    clean = term.replace("room interior design", "").strip()
-    return [
-        f"A beautiful styled room featuring a premium {clean}, editorial interior photography, Architectural Digest style, 8K, photorealistic.",
-        f"A close-up high-resolution shot of an elegant {clean} in a modern designer interior, editorial interior photography, Architectural Digest style, 8K, photorealistic.",
-        f"A luxury room styled with a sleek {clean} illuminated by warm evening lighting, editorial interior photography, Architectural Digest style, 8K, photorealistic.",
-        f"A contemporary living space with a high-end designer {clean} in a curated color palette, editorial interior photography, Architectural Digest style, 8K, photorealistic.",
-        f"A dramatic, cinematic shot of a stunning designer {clean} with rich textures and striking lighting, editorial interior photography, Architectural Digest style, 8K, photorealistic."
-    ]
+def get_airtable_attached_filenames():
+    """Retrieve a set of all filenames currently attached to 'Reference Photo' in Airtable."""
+    url     = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE}"
+    headers = {
+        "Authorization": f"Bearer {AIRTABLE_TOKEN}",
+        "Content-Type":  "application/json",
+    }
+    filenames = set()
+    offset = None
+    
+    try:
+        while True:
+            params = {
+                "view": AIRTABLE_VIEW,
+                "fields": ["Reference Photo"],
+                "maxRecords": 100
+            }
+            if offset:
+                params["offset"] = offset
+                
+            resp = requests.get(url, headers=headers, params=params, timeout=15)
+            if resp.status_code != 200:
+                print(f"  [AIRTABLE] Error fetching attached filenames: {resp.text}")
+                break
+                
+            data = resp.json()
+            for record in data.get("records", []):
+                attachments = record.get("fields", {}).get("Reference Photo", [])
+                if isinstance(attachments, list):
+                    for att in attachments:
+                        fn = att.get("filename")
+                        if fn:
+                            filenames.add(fn)
+                            
+            offset = data.get("offset")
+            if not offset:
+                break
+                
+    except Exception as e:
+        print(f"  [AIRTABLE] Exception fetching attached filenames: {e}")
+        
+    return filenames
+
+
+def get_zoho_approved_files(access_token, folder_id):
+    """List all files in the given Approved folder in Zoho WorkDrive, sorted newest to oldest."""
+    url = f"https://workdrive.zoho.com/api/v1/files/{folder_id}/files"
+    headers = {
+        "Authorization": f"Zoho-oauthtoken {access_token}",
+        "Accept":        "application/vnd.api+json",
+    }
+    try:
+        res = requests.get(url, headers=headers, timeout=15)
+        if res.status_code == 200:
+            files = []
+            for item in res.json().get("data", []):
+                attrs = item.get("attributes", {})
+                if attrs.get("type") != "folder":
+                    files.append({
+                        "id": item.get("id"),
+                        "name": attrs.get("name"),
+                        "created_time_ms": attrs.get("created_time_in_millisecond", 0)
+                    })
+            # Sort files newest to oldest (largest created_time_ms first)
+            files.sort(key=lambda x: x.get("created_time_ms", 0), reverse=True)
+            return files
+        else:
+            print(f"[ZOHO] Error listing files in Approved folder: {res.text}")
+    except Exception as e:
+        print(f"[ZOHO] Exception listing files: {e}")
+    return []
+
+
+def download_zoho_file(access_token, file_id, filename):
+    """Download file bytes directly using a temporary public share link from Zoho."""
+    share_url = create_zoho_share_link(access_token, file_id, filename)
+    if not share_url:
+        print(f"  [DOWNLOAD] Failed to create Zoho share link for download.")
+        return None
+    try:
+        resp = requests.get(share_url, timeout=30)
+        if resp.status_code == 200:
+            return resp.content
+        print(f"  [DOWNLOAD] Failed to download from share link: status {resp.status_code}")
+    except Exception as e:
+        print(f"  [DOWNLOAD] Exception downloading from share link: {e}")
+    return None
+
 
 def generate_all_prompts(image_bytes: bytes, mime: str, retries: int = 3) -> list[str] | None:
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     
     system_prompt = (
-        "You are an interior design prompt writer for AI image generators. "
-        "Study the photo and write 5 different, vivid, specific image generation prompts. "
-        "Each prompt should be 2-3 sentences long and describe room type, hero furniture/light, materials, color palette, lighting quality, and mood. "
-        "End each prompt with: 'editorial interior photography, Architectural Digest style, 8K, photorealistic.'\n\n"
-        "Return ONLY a valid JSON object with a single key 'prompts' containing the list of 5 prompt strings. No extra text or markdown formatting."
+        "You are a world-class premium room interior designer. "
+        "Your job is to analyze the provided reference photo and write exactly 5 distinct, highly detailed prompts that will generate PURE interior room photography. "
+        "CRITICAL RULES: "
+        "1. The generated image must be a PURE PHOTOGRAPH of a beautiful interior room — absolutely NO text, NO labels, NO watermarks, NO titles, NO captions, NO overlays of any kind. "
+        "2. Describe the room scene in vivid detail: the room type (living room, dining room, bedroom, foyer, etc.), the hero light fixture (its shape, materials, glow, hanging style), "
+        "the surrounding furniture and decor, wall treatments, flooring, color palette, spatial layout, natural or artificial lighting quality, and the overall mood/atmosphere. "
+        "3. Each prompt must describe a complete, photorealistic interior room scene — as if photographed for Architectural Digest magazine. "
+        "4. Do NOT mention any brand names, product codes, or text elements. Focus purely on visual description of the space.\n\n"
+        "Return ONLY a valid JSON object with a single key 'prompts' containing a list of exactly 5 prompt strings. No extra text or markdown."
     )
 
     user_prompt = (
-        "Analyze this image and write exactly 5 different prompt variations based on these angles:\n"
-        "1. Variation 1: Describe this exact scene faithfully - same materials, colors, light, and composition.\n"
-        "2. Variation 2: Same style and palette but from a different camera angle (zoom in or pull back).\n"
-        "3. Variation 3: Same room and furniture but change the lighting to evening with warm lamp glow.\n"
-        "4. Variation 4: Same layout and lighting but shift the accent colors to a different premium palette.\n"
-        "5. Variation 5: Push the drama - more cinematic, richer textures, more striking light. Architectural Digest cover shot.\n\n"
-        "Output your response ONLY as a valid JSON object matching this structure:\n"
+        "Look at this reference photo carefully. Based on the light fixture and interior style you see, write 5 different detailed interior room photography prompts:\n"
+        "1. Faithfully describe this exact room scene — the layout, materials, colors, fixture details, furniture, and lighting atmosphere. End with: 'photorealistic interior photography, Architectural Digest style, 8K.'\n"
+        "2. A different room type or angle featuring the same style of light fixture — for example, a wide-angle view of a luxurious dining room or a cozy reading nook. Same photorealistic quality.\n"
+        "3. The same room but in evening ambiance — warm golden glow from the fixture, soft shadows, intimate sophisticated atmosphere.\n"
+        "4. Same fixture style but in a completely different interior design theme — for example, modern minimalist, art deco, Scandinavian, industrial chic, or Mediterranean villa.\n"
+        "5. A dramatic editorial cover-worthy shot — cinematic lighting, rich textures, deep contrasts, and stunning spatial composition.\n\n"
+        "IMPORTANT: Every prompt must describe ONLY a visual interior room scene. NO text, NO labels, NO watermarks in the image. Pure photography only.\n\n"
+        "Output ONLY a valid JSON object:\n"
         "{\n"
         "  \"prompts\": [\n"
-        "    \"Variation 1 prompt text...\",\n"
-        "    \"Variation 2 prompt text...\",\n"
-        "    \"Variation 3 prompt text...\",\n"
-        "    \"Variation 4 prompt text...\",\n"
-        "    \"Variation 5 prompt text...\"\n"
+        "    \"Prompt 1...\",\n"
+        "    \"Prompt 2...\",\n"
+        "    \"Prompt 3...\",\n"
+        "    \"Prompt 4...\",\n"
+        "    \"Prompt 5...\"\n"
         "  ]\n"
         "}"
     )
@@ -496,8 +579,7 @@ def generate_all_prompts(image_bytes: bytes, mime: str, retries: int = 3) -> lis
                 ],
             },
         ],
-        "temperature": 0.7,
-        "response_format": {"type": "json_object"}
+        "temperature": 0.7
     }
 
     for attempt in range(1, retries + 2):
@@ -510,7 +592,7 @@ def generate_all_prompts(image_bytes: bytes, mime: str, retries: int = 3) -> lis
                 timeout=300,
             )
             if resp.status_code != 200:
-                print(f"    [PROMPT GEN] HTTP {resp.status_code} (attempt {attempt})")
+                print(f"    [PROMPT GEN] HTTP {resp.status_code} (attempt {attempt}): {resp.text[:200]}")
                 continue
 
             content = resp.json()["choices"][0]["message"]["content"].strip()
@@ -543,20 +625,20 @@ def push_photo_and_prompts(access_token, file_id, filename, image_bytes, mime, c
     share_url = create_zoho_share_link(access_token, file_id, filename)
     if not share_url:
         print(f"  [AIRTABLE] Could not create Zoho share link — skipping.")
-        return
+        return False
 
     # ── Step 2: Fetch 5 Standby records upfront (1 API call) ────────────
     records = get_standby_records(n=5)
     if not records:
         print(f"  [AIRTABLE] No Standby records available — skipping.")
-        return
+        return False
 
     print(f"\n  [PROMPT GEN] Generating 5 prompt variations in a single local LLM call...")
     prompts = generate_all_prompts(image_bytes, mime)
 
     if not prompts:
-        print(f"  [PROMPT GEN] Single-call generation failed. Applying high-quality fallback templates...")
-        prompts = get_fallback_prompts(category)
+        print(f"  [PROMPT GEN] [WARNING] Single-call prompt generation failed. Skipping this image for Airtable upload to avoid generic fallbacks.")
+        return False
 
     # ── Step 3: Insert variations to Airtable ────────────────────────────
     print(f"  [AIRTABLE] Inserting variations to Airtable...")
@@ -566,11 +648,11 @@ def push_photo_and_prompts(access_token, file_id, filename, image_bytes, mime, c
         sku       = fields.get("SKU Code", "N/A")
         item_name = fields.get("Item Name", "N/A")
         
-        prompt = prompts[i] if i < len(prompts) else get_fallback_prompts(category)[i]
+        prompt = prompts[i]
 
         patch = {}
         if i == 0:
-            patch["Styled Photo"] = [{"url": share_url}]   # photo only on row 1
+            patch["Reference Photo"] = [{"url": share_url}]   # photo only on row 1
         if prompt:
             patch["Styled Photo Prompt"] = prompt
 
@@ -584,6 +666,7 @@ def push_photo_and_prompts(access_token, file_id, filename, image_bytes, mime, c
                 print(f"    [AIRTABLE] [X] Insert failed -> {sku}")
 
         time.sleep(0.2)
+    return True
 
 
 # ─────────────────────────────────────────────
@@ -810,6 +893,62 @@ def worker(term, folder_id, access_token, fresh=False, headless=True):
 
         category_raw_dir = os.path.join(LOCAL_RAW_DIR, subfolder)
         os.makedirs(category_raw_dir, exist_ok=True)
+
+        # ─────────────────────────────────────────────────────────────
+        #  BACKLOG CHECK: Process existing Zoho approved files first
+        # ─────────────────────────────────────────────────────────────
+        print(f"\n[{term}] Checking Zoho Approved backlog before scraping...")
+        approved_files = get_zoho_approved_files(access_token, folder_id)
+        if approved_files:
+            print(f"[{term}] Found {len(approved_files)} approved files in Zoho.")
+            
+            # Fetch already-attached filenames in Airtable to avoid duplication
+            attached_filenames = get_airtable_attached_filenames()
+            print(f"[{term}] Found {len(attached_filenames)} attached filenames in Airtable.")
+            
+            # Filter files that are in Zoho Approved but NOT in Airtable
+            backlog_files = [f for f in approved_files if f["name"] not in attached_filenames]
+            
+            if backlog_files:
+                print(f"[{term}] Found {len(backlog_files)} files in Zoho Approved backlog that need to be attached to Airtable: {[f['name'] for f in backlog_files]}")
+                for idx, zoho_file in enumerate(backlog_files):
+                    filename = zoho_file["name"]
+                    print(f"\n  [BACKLOG] Processing file {idx+1}/{len(backlog_files)}: {filename}")
+                    
+                    # 1. Download image bytes
+                    image_bytes = download_zoho_file(access_token, zoho_file["id"], filename)
+                    if not image_bytes:
+                        print(f"  [BACKLOG] Download failed for {filename} — skipping.")
+                        continue
+                        
+                    # 2. Determine MIME type
+                    lower_name = filename.lower()
+                    if ".png" in lower_name:
+                        mime = "image/png"
+                    elif ".webp" in lower_name:
+                        mime = "image/webp"
+                    else:
+                        mime = "image/jpeg"
+                        
+                    # 3. Push to Airtable and generate prompts
+                    try:
+                        push_photo_and_prompts(
+                            access_token=access_token,
+                            file_id=zoho_file["id"],
+                            filename=filename,
+                            image_bytes=image_bytes,
+                            mime=mime,
+                            category=term
+                        )
+                    except Exception as e:
+                        print(f"  [BACKLOG] [ERROR] Pushing to Airtable: {e}")
+                        
+                    time.sleep(1.0)
+            else:
+                print(f"[{term}] Zoho Approved backlog is completely synced with Airtable. Proceeding...")
+        else:
+            print(f"[{term}] No files found in Zoho Approved folder.")
+        # ─────────────────────────────────────────────────────────────
 
         if fresh:
             clear_manifest_category(term)

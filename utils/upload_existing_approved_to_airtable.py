@@ -13,13 +13,14 @@ from scrape_and_upload import (
     AIRTABLE_TOKEN,
     AIRTABLE_BASE_ID,
     AIRTABLE_TABLE,
-    AIRTABLE_VIEW
+    AIRTABLE_VIEW,
+    push_photo_and_prompts
 )
 
 CHANDELIER_APPROVED_FOLDER = "ambg55491197ac32c45c3b0d4e5bb7f07d834"
 
 def get_zoho_approved_files(access_token):
-    """List all files in the Chandelier Approved folder in Zoho WorkDrive."""
+    """List all files in the Chandelier Approved folder in Zoho WorkDrive, sorted newest to oldest."""
     url = f"https://workdrive.zoho.com/api/v1/files/{CHANDELIER_APPROVED_FOLDER}/files"
     headers = {
         "Authorization": f"Zoho-oauthtoken {access_token}",
@@ -34,8 +35,11 @@ def get_zoho_approved_files(access_token):
                 if attrs.get("type") != "folder":
                     files.append({
                         "id": item.get("id"),
-                        "name": attrs.get("name")
+                        "name": attrs.get("name"),
+                        "created_time_ms": attrs.get("created_time_in_millisecond", 0)
                     })
+            # Sort files newest to oldest (largest created_time_ms first)
+            files.sort(key=lambda x: x.get("created_time_ms", 0), reverse=True)
             return files
         else:
             print(f"[ZOHO] Error listing files in Approved folder: {res.text}")
@@ -43,146 +47,122 @@ def get_zoho_approved_files(access_token):
         print(f"[ZOHO] Exception listing files: {e}")
     return []
 
-def get_empty_standby_airtable_records():
-    """Fetch Airtable records in the view where Status is 'Standby' and Styled Photo is empty."""
+def clear_all_standby_records():
+    """Clear Reference Photo, Styled Photo, and Styled Photo Prompt fields for all Standby records to start fresh."""
     url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE}"
     headers = {
         "Authorization": f"Bearer {AIRTABLE_TOKEN}",
         "Content-Type":  "application/json",
     }
-    # Filter for Status = 'Standby' and 'Styled Photo' is blank
+    # Find all Standby records
     params = {
         "view":            AIRTABLE_VIEW,
-        "filterByFormula": "AND({Status} = 'Standby', {Styled Photo} = BLANK())",
-        "maxRecords":      100
+        "filterByFormula": "{Status} = 'Standby'",
+        "maxRecords":      150
     }
     try:
+        print("[CLEAR] Listing Standby records in Airtable to clear...")
         resp = requests.get(url, headers=headers, params=params, timeout=15)
         if resp.status_code == 200:
-            return resp.json().get("records", [])
-        else:
-            print(f"[AIRTABLE] Error fetching records: {resp.text}")
-    except Exception as e:
-        print(f"[AIRTABLE] Exception fetching records: {e}")
-    return []
-
-def patch_airtable_record(record_id, share_link):
-    """Attach the Zoho share link to the 'Styled Photo' field in Airtable."""
-    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE}/{record_id}"
-    headers = {
-        "Authorization": f"Bearer {AIRTABLE_TOKEN}",
-        "Content-Type":  "application/json",
-    }
-    payload = {
-        "fields": {
-            "Styled Photo": [{"url": share_link}]
-        }
-    }
-    try:
-        resp = requests.patch(url, headers=headers, json=payload, timeout=15)
-        return resp.status_code == 200
-    except Exception as e:
-        print(f"[AIRTABLE] Exception patching record {record_id}: {e}")
-    return False
-
-def get_already_attached_filenames():
-    """Fetch all filenames that are already attached to the 'Styled Photo' field in Airtable."""
-    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE}"
-    headers = {
-        "Authorization": f"Bearer {AIRTABLE_TOKEN}",
-        "Content-Type":  "application/json",
-    }
-    params = {
-        "view":            AIRTABLE_VIEW,
-        "filterByFormula": "NOT({Styled Photo} = BLANK())",
-        "maxRecords":      500
-    }
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=15)
-        if resp.status_code == 200:
-            filenames = set()
-            for record in resp.json().get("records", []):
+            records = resp.json().get("records", [])
+            print(f"[CLEAR] Found {len(records)} Standby records in Airtable to clean up...")
+            cleaned = 0
+            for record in records:
                 fields = record.get("fields", {})
-                attachments = fields.get("Styled Photo", [])
-                for att in attachments:
-                    fn = att.get("filename")
-                    if fn:
-                        filenames.add(fn)
-            return filenames
+                record_id = record.get("id")
+                sku = fields.get("SKU Code", "N/A")
+                
+                # Check if fields are populated
+                if fields.get("Reference Photo") or fields.get("Styled Photo") or fields.get("Styled Photo Prompt"):
+                    payload = {
+                        "fields": {
+                            "Reference Photo": None,
+                            "Styled Photo": None,
+                            "Styled Photo Prompt": None
+                        }
+                    }
+                    p_resp = requests.patch(f"{url}/{record_id}", headers=headers, json=payload, timeout=15)
+                    if p_resp.status_code == 200:
+                        cleaned += 1
+            print(f"[CLEAR] Successfully cleared {cleaned} populated Standby records!")
         else:
-            print(f"[AIRTABLE] Error fetching populated records: {resp.text}")
+            print(f"[CLEAR] Error listing records: {resp.text}")
     except Exception as e:
-        print(f"[AIRTABLE] Exception fetching populated records: {e}")
-    return set()
+        print(f"[CLEAR] Exception clearing records: {e}")
+
+def download_zoho_file(access_token, file_id, filename):
+    """Download file bytes directly using a temporary public share link from Zoho."""
+    share_url = create_zoho_share_link(access_token, file_id, filename)
+    if not share_url:
+        print(f"  [DOWNLOAD] Failed to create Zoho share link for download.")
+        return None
+    try:
+        resp = requests.get(share_url, timeout=30)
+        if resp.status_code == 200:
+            return resp.content
+        print(f"  [DOWNLOAD] Failed to download from share link: status {resp.status_code}")
+    except Exception as e:
+        print(f"  [DOWNLOAD] Exception downloading from share link: {e}")
+    return None
 
 def main():
     print("[BATCH START] Fetching Zoho access token...")
     access_token = get_access_token()
     print("[ZOHO] Access token retrieved successfully.")
     
+    # Clean up Standby Airtable fields to ensure a fresh, perfectly aligned gap layout
+    clear_all_standby_records()
+    
     print(f"\n[1] Listing approved files inside Zoho Chandelier Approved folder ('{CHANDELIER_APPROVED_FOLDER}')...")
     approved_files = get_zoho_approved_files(access_token)
-    print(f"Found {len(approved_files)} approved files in Zoho.")
+    print(f"Found {len(approved_files)} approved files in Zoho (sorted newest to oldest).")
     
     if not approved_files:
-        print("[BATCH DONE] No approved files found in Zoho Chandelier folder. Exiting.")
+        print("[BATCH DONE] No approved files found in Zoho Chandelier Approved folder. Exiting.")
         return
         
-    print("\n[2] Checking which files are already attached to Airtable...")
-    attached_names = get_already_attached_filenames()
-    print(f"Found {len(attached_names)} files already attached in Airtable.")
-    
-    # Filter out already attached files
-    to_process = [f for f in approved_files if f["name"] not in attached_names]
-    print(f"Found {len(to_process)} NEW approved files to attach.")
-    
-    if not to_process:
-        print("[BATCH DONE] All approved files are already attached to Airtable! Nothing to do.")
-        return
-        
-    print("\n[3] Fetching empty Standby records from Airtable...")
-    airtable_records = get_empty_standby_airtable_records()
-    print(f"Found {len(airtable_records)} empty Standby records in Airtable.")
-    
-    if not airtable_records:
-        print("[BATCH DONE] No empty Standby records available in Airtable. Exiting.")
-        return
-        
-    print(f"\n[4] Starting batch attachment process (Max {min(len(to_process), len(airtable_records))} operations)...")
+    print(f"\n[2] Starting batch prompt and attachment pipeline (Max {len(approved_files)} operations)...")
     
     success_count = 0
-    for idx, zoho_file in enumerate(to_process):
-        if idx >= len(airtable_records):
-            print("\n[BATCH] Ran out of empty Airtable records. Stopping.")
-            break
-            
-        record = airtable_records[idx]
-        record_id = record.get("id")
-        fields = record.get("fields", {})
-        sku = fields.get("SKU Code", "N/A")
-        item_name = fields.get("Item Name", "N/A")
+    for idx, zoho_file in enumerate(approved_files):
+        print(f"\n" + "="*60)
+        print(f"Processing Chandelier {idx+1}/{len(approved_files)}:")
+        print(f"  Zoho File: {zoho_file['name']} (ID: {zoho_file['id']})")
         
-        print(f"\nProcessing {idx+1}/{min(len(to_process), len(airtable_records))}:")
-        print(f"  Zoho File: {zoho_file['name']}")
-        print(f"  Airtable : {sku} - {item_name}")
-        
-        # 1. Create Zoho public download link
-        share_link = create_zoho_share_link(access_token, zoho_file["id"], zoho_file["name"])
-        if not share_link:
-            print("  [X] Failed to create Zoho share link. Skipping.")
+        # 1. Download image bytes from Zoho
+        print("  Downloading file from Zoho...")
+        image_bytes = download_zoho_file(access_token, zoho_file["id"], zoho_file["name"])
+        if not image_bytes:
+            print("  [X] Failed to download file from Zoho. Skipping.")
             continue
             
-        # 2. Patch Airtable record
-        ok = patch_airtable_record(record_id, share_link)
-        if ok:
-            print(f"  [OK] Successfully attached photo to Airtable!")
-            success_count += 1
+        # 2. Determine MIME type
+        lower_name = zoho_file["name"].lower()
+        if ".png" in lower_name:
+            mime = "image/png"
+        elif ".webp" in lower_name:
+            mime = "image/webp"
         else:
-            print(f"  [X] Failed to patch Airtable record.")
+            mime = "image/jpeg"
             
-        time.sleep(0.5)  # Soft throttle to stay safe with Airtable rate limits
+        # 3. Trigger premium room interior designer push pipeline
+        print("  Launching premium push pipeline (1 photo attached to 'Reference Photo', 5 prompts generated)...")
+        try:
+            push_photo_and_prompts(
+                access_token=access_token,
+                file_id=zoho_file["id"],
+                filename=zoho_file["name"],
+                image_bytes=image_bytes,
+                mime=mime,
+                category="Architectural Digest sculptural Chandeliers"
+            )
+            success_count += 1
+        except Exception as e:
+            print(f"  [X] Error during push pipeline: {e}")
+            
+        time.sleep(1.0)  # Safe breathing room between LLM requests and Airtable uploads
         
-    print(f"\n[BATCH DONE] Successfully attached {success_count} approved photos to Airtable!")
+    print(f"\n[BATCH DONE] Successfully processed {success_count}/{len(approved_files)} approved chandeliers into Airtable!")
 
 if __name__ == "__main__":
     main()
